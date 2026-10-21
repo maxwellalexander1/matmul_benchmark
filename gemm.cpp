@@ -4,8 +4,11 @@
 #include <iostream>
 #include <algorithm>
 #include <chrono>
+#include <immintrin.h>
+#include <cblas.h>
 
 using Matrix = std::vector<float>;
+using GemmFn = void (*)(const Matrix&, const Matrix&, Matrix&, int);
 constexpr int BS = 64;
 
 Matrix make_random(int n, unsigned seed) {
@@ -42,12 +45,15 @@ void gemm_ikj(const Matrix& A, const Matrix& B, Matrix& C, int n) {
 }
 
 double max_rel_error(const Matrix& x, const Matrix& ref) {
+  double scale = 0.0;
+  for (size_t i = 0; i < ref.size(); i++) {
+    scale = std::max(scale, (double)std::fabs(ref[i]));
+  }
+
   double worst = 0.0;
   for (size_t i = 0; i < x.size(); i++) {
-    double err = std::fabs(x[i] - ref[i]) / std::max(std::fabs(ref[i]), 1e-6f);
-    if (err > worst){
-      worst = err; 
-    }
+    double err = std::fabs((double)x[i] - (double)ref[i]) / scale;
+    worst = std::max(worst, err);
   }
   return worst;
 }
@@ -98,23 +104,143 @@ void gemm_blocked(const Matrix& A, const Matrix& B, Matrix& C, int n) {
  }
 }
 
+void gemm_reg4x4(const Matrix& A, const Matrix& B, Matrix& C, int n) {
+  for (int i = 0; i < n; i += 4) {
+    for (int j = 0; j < n; j += 4) {
+      float c[4][4] = {};
 
+      for (int k = 0; k < n; k++) {
+        for (int di = 0; di < 4; di++) {
+          for (int dj = 0; dj < 4; dj++) {
+            c[di][dj] += A[(i + di) * n + k] * B[k * n + (j + dj)];
+          }
+        }
+      }
+
+      for (int di = 0; di < 4; di++) {
+        for (int dj = 0; dj < 4; dj++) {
+          C[(i + di) * n + (j + dj)] = c[di][dj];
+        }
+      }
+    }
+  }
+}
+
+void gemm_avx4x16(const Matrix& A, const Matrix& B, Matrix& C, int n) {
+  for (int i = 0; i < n; i += 4) {
+    for (int j = 0; j < n; j += 16) {
+      __m256 c[4][2];
+      for (int di = 0; di < 4; di++) {
+        c[di][0] = _mm256_setzero_ps();
+        c[di][1] = _mm256_setzero_ps();
+      }
+
+      for (int k = 0; k < n; k++) {
+        __m256 b0 = _mm256_loadu_ps(&B[k * n + j]);       // columns j..j+7
+        __m256 b1 = _mm256_loadu_ps(&B[k * n + j + 8]);   // columns j+8..j+15
+        for (int di = 0; di < 4; di++) {
+          __m256 a = _mm256_set1_ps(A[(i + di) * n + k]);
+          c[di][0] = _mm256_fmadd_ps(a, b0, c[di][0]);
+          c[di][1] = _mm256_fmadd_ps(a, b1, c[di][1]);
+        }
+      }
+
+      for (int di = 0; di < 4; di++) {
+        _mm256_storeu_ps(&C[(i + di) * n + j],     c[di][0]);
+        _mm256_storeu_ps(&C[(i + di) * n + j + 8], c[di][1]);
+      }
+    }
+  }
+}
+
+void gemm_avx4x8(const Matrix& A, const Matrix& B, Matrix& C, int n) {
+  for (int i = 0; i < n; i += 4) {
+    for (int j = 0; j < n; j += 8) {
+      __m256 c[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                     _mm256_setzero_ps(), _mm256_setzero_ps()};
+
+      for (int k = 0; k < n; k++) {
+        __m256 b = _mm256_loadu_ps(&B[k * n + j]);
+            for (int di = 0; di < 4; di++) {
+          __m256 a = _mm256_set1_ps(A[(i + di) * n + k]); 
+          c[di] = a * b + c[di];
+        }
+      }
+
+      for (int di = 0; di < 4; di++) {
+        _mm256_storeu_ps(&C[(i + di) * n + j], c[di]);
+      }
+    }
+  }
+}
+
+constexpr int KC = 256;
+
+void gemm_avx4x16_kc(const Matrix& A, const Matrix& B, Matrix& C, int n) {
+  std::fill(C.begin(), C.end(), 0.0f);
+  for (int kk = 0; kk < n; kk += KC) {
+    int kend = std::min(kk + KC, n);
+    for (int j = 0; j < n; j += 16) {
+      for (int i = 0; i < n; i += 4) {
+        __m256 c[4][2];
+        for (int di = 0; di < 4; di++) {
+          c[di][0] = _mm256_loadu_ps(&C[(i + di) * n + j]);
+          c[di][1] = _mm256_loadu_ps(&C[(i + di) * n + j + 8]);
+        }
+
+        for (int k = kk; k < kend; k++) {
+          __m256 b0 = _mm256_loadu_ps(&B[k * n + j]);
+          __m256 b1 = _mm256_loadu_ps(&B[k * n + j + 8]);
+          for (int di = 0; di < 4; di++) {
+            __m256 a = _mm256_set1_ps(A[(i + di) * n + k]);
+            c[di][0] = _mm256_fmadd_ps(a, b0, c[di][0]);
+            c[di][1] = _mm256_fmadd_ps(a, b1, c[di][1]);
+          }
+        }
+
+        for (int di = 0; di < 4; di++) {
+          _mm256_storeu_ps(&C[(i + di) * n + j],     c[di][0]);
+          _mm256_storeu_ps(&C[(i + di) * n + j + 8], c[di][1]);
+        }
+      }
+    }
+  }
+}
+
+void gemm_openblas(const Matrix& A, const Matrix& B, Matrix& C, int n) {
+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+              n, n, n, 1.0f, A.data(), n, B.data(), n, 0.0f, C.data(), n);
+}
 
 int main() {
+  struct Impl { const char* name; GemmFn f; };
+  Impl impls[] = {
+    {"naive",   gemm_naive},
+    {"ikj",     gemm_ikj},
+    //{"blocked", gemm_blocked},
+    {"reg4x4",  gemm_reg4x4},
+    {"avx4x8",  gemm_avx4x8},
+    {"avx4x16", gemm_avx4x16},
+    {"av4x16_kc", gemm_avx4x16_kc},
+    {"openblas", gemm_openblas},
+  };
+
   const int n = 256;
   Matrix A = make_random(n, 1);
   Matrix B = make_random(n, 2);
-  Matrix C_naive(n * n);
-  Matrix C_ikj(n * n);
+  Matrix ref(n * n);
+  gemm_naive(A, B, ref, n);
 
-  gemm_naive(A, B, C_naive, n);
-  gemm_ikj(A, B, C_ikj, n);
-  std::cout << "max rel error: " << max_rel_error(C_ikj, C_naive) << "\n";
+  for (auto& impl : impls) {
+    Matrix C(n * n);
+    impl.f(A, B, C, n);
+    std::cout << impl.name << " err: " << max_rel_error(C, ref) << "\n";
+  }
 
-  for (int size : {256, 512, 1024}) {
-    std::cout << "n=" << size
-              << "  naive: " << bench(gemm_naive, size) << " GFLOP/s"
-              << "  ikj: "   << bench(gemm_ikj, size)   << " GFLOP/s\n";
-
+  for (int size : {256, 512, 1008, 1024, 1040}) {
+    std::cout << "n=" << size << "\n";
+    for (auto& impl : impls) {
+      std::cout << "  " << impl.name << ": " << bench(impl.f, size) << " GFLOP/s\n";
+    }
   }
 }
