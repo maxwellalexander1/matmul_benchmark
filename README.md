@@ -18,15 +18,6 @@ step by step and benchmarked on one core of an [i5-12600K, pinned to a P-core].
 All versions validated against the naive result: max error, normalized by
 the largest output value, about 2.4e-7.
 
-## What I learned
-- Loop order alone: [fill in].
-- n = 1024 vs 1008/1040: naive drops about 4x at exactly 1024. [your
-  explanation: power-of-two row stride maps B's rows to the same cache sets].
-- Register blocking: [fill in what the loads-per-flop count was].
-- avx4x8 vs avx4x16: [fill in; the FMA latency / accumulator count idea].
-- Cache blocking (textbook version) did not help here, but k-blocking did.
-  [fill in why you think so].
-
 ## Where it falls short
 About 30 to 42% of single-threaded OpenBLAS. Not implemented: packing,
 L2 blocking, prefetching, threading.
